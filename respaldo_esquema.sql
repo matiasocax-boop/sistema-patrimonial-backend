@@ -1,0 +1,51 @@
+-- ============================================================================
+-- RESPALDO DE ESQUEMA - Sistema de Gestion Patrimonial UNP
+-- ============================================================================
+-- ATENCION: este archivo esta VACIO a proposito.
+--
+-- Se creo vacio y nunca se completo. No lo tomes como un respaldo valido:
+-- si necesitas el esquema, generalo con los comandos de abajo.
+--
+-- Por que quedo vacio: el proyecto migro de SQLite a Supabase (PostgreSQL).
+-- Ese dump se genero en otra maquina y nunca se copio aqui. El esquema real
+-- vive hoy en la base de datos de Supabase, no en este repositorio.
+--
+-- ---------------------------------------------------------------------------
+-- COMO GENERAR UN RESPALDO REAL (pg_dump)
+-- ---------------------------------------------------------------------------
+--   1) Instalar PostgreSQL client (si no lo tenes):
+--        winget install PostgreSQL.PostgreSQL        # Windows
+--        brew install libpq                          # macOS
+--        sudo apt install postgresql-client          # Linux
+--
+--   2) Exportar SOLO el esquema (sin datos), apuntando a tu proyecto:
+--        pg_dump "$DATABASE_URL" --schema-only --no-owner -s respaldo_esquema.sql
+--
+--   3) Si tambien queres los datos (contienen informacion patrimonial real,
+--      tratalos como datos sensibles y NO los subas al repositorio):
+--        pg_dump "$DATABASE_URL" --no-owner -Fc > respaldo_datos.dump
+--
+-- ---------------------------------------------------------------------------
+-- COMO GENERAR UN RESPALDO DESDE EL SQL EDITOR DE SUPABASE
+-- ---------------------------------------------------------------------------
+-- Dashboard > SQL Editor > New query > pg_dump schema > copiar el resultado
+-- en este archivo.
+--
+-- ---------------------------------------------------------------------------
+-- TABLAS CONOCIDAS DEL SISTEMA
+-- ---------------------------------------------------------------------------
+-- Derivadas de backend/server.js y del cliente Supabase:
+--
+--   bens          -- bienes patrimoniales
+--   fc10          -- fichas FC-10
+--   fc11          -- fichas FC-11
+--   fc04          -- fichas FC-04
+--   estructuras   -- estructuras organizativas
+--   usuarios      -- perfiles (username, nombre, cargo, dependencia)
+--   auditoria     -- bitacora de acciones
+--   app_config    -- configuracion global (incl. modo mantenimiento)
+--
+-- IMPORTANTE: cada tabla (excepto usuarios y auditoria) guarda el registro
+-- completo dentro de una columna JSONB llamada 'data'. Verificar el esquema
+-- real antes de asumir columnas.
+-- ============================================================================

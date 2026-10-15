@@ -1,0 +1,68 @@
+# ============================================================================
+# .gitignore - Sistema de Gestion Patrimonial UNP
+# ============================================================================
+# Este archivo es la RED DE SEGURIDAD principal. Los .gitignore de backend/ y
+# frontend/ existen, pero hasta ahora no habia repositorio, asi que nada
+# estaba realmente protegido. Este archivo cubre el arbol completo.
+# ============================================================================
+
+# --- Dependencias -----------------------------------------------------------
+node_modules/
+.pnp
+.pnp.js
+
+# --- Repositorio anidado ---------------------------------------------------
+# frontend/ tiene su propio repositorio (228 commits + remoto en GitHub) y su
+# historial NO debe mezclarse con el de la raiz. Este repositorio raiz cubre
+# unicamente backend/, vercel.json y respaldo_esquema.sql, que hasta ahora
+# no estaban bajo control de versiones en absoluto.
+frontend/
+
+# --- Artefactos de build ----------------------------------------------------
+dist/
+build/
+.vite/
+*.tsbuildinfo
+
+# --- Secretos / configuracion local (NUNCA commitear) ----------------------
+# El patron .env.* ignora todos los entornos; la excepcion_readmite los
+# archivos .example que si son la documentacion de las variables.
+.env
+.env.*
+!.env.example
+
+# --- Bases de datos locales / artefactos legacy ----------------------------
+# backend/patrimonio.sqlite es un residuo de la migracion SQLite -> Supabase.
+# Puede contener datos reales de bienes, por lo que jamas debe entrar al repo.
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+
+# --- Despliegue -------------------------------------------------------------
+.vercel/
+.netlify/
+*.tsbuildmap
+
+# --- Logs y procesos --------------------------------------------------------
+logs/
+*.log
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.pid
+*.seed
+
+# --- Cobertura de tests -----------------------------------------------------
+coverage/
+.nyc_output/
+
+# --- Sistema operativo / editores ------------------------------------------
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+*~
