@@ -71,3 +71,6 @@ Desktop.ini
 !.vscode/extensions.json
 *.swp
 *~
+# vercel.json del root: Vercel despliega desde frontend/, donde si hay
+# package.json. En la raiz Vercel no detecta el proyecto.
+vercel.json
