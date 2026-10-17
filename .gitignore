@@ -11,6 +11,11 @@ node_modules/
 .pnp
 .pnp.js
 
+# Residuo de un `npm install` ejecutado en la raíz: se generó un
+# package-lock.json sin package.json acompañante. Los proyectos reales con
+# manifiesto viven en backend/ y frontend/ (este último en su propio repo).
+package-lock.json
+
 # --- Repositorio anidado ---------------------------------------------------
 # frontend/ tiene su propio repositorio (228 commits + remoto en GitHub) y su
 # historial NO debe mezclarse con el de la raiz. Este repositorio raiz cubre
