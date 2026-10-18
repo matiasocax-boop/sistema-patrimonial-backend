@@ -2,9 +2,11 @@
  * ============================================================================
  * SERVIDOR BACKEND (API REST) - SISTEMA DE GESTIÓN PATRIMONIAL UNP (SUPABASE)
  * ============================================================================
- * Maneja las peticiones PostgreSQL parseando la columna JSON 'data' para todas
- * las entidades (bens, fc10, fc11, fc04, estructuras).
+ * API auxiliar sobre PostgreSQL (columna JSONB `data`). La SPA en producción
+ * habla con Supabase Auth + RLS; este servidor no debe quedar abierto.
  */
+
+require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
@@ -13,49 +15,61 @@ const { Server } = require('socket.io');
 const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const { parseRowData, idValido, esPrivilegiado } = require('./lib/helpers');
+const { cabecerasSeguras, crearLimitadorLogin, tablaEnBlanco, crearLimitadorGeneral, sanitizarObjeto } = require('./lib/security');
+const { validarEntradaLogin, autenticarUsuario } = require('./lib/auth');
+const { exigirAdmin } = require('./lib/authz');
+const {
+  validarEsquemaRespaldo,
+  armarRespaldo,
+  ORDEN_RESTAURACION,
+  TABLAS_CONOCIDAS,
+  normalizarFilaParaEscribir
+} = require('./lib/respaldo');
 
-const app = express();
+const BCRYPT_ROUNDS = 12;
+const MAX_BULK = 2000;
 const PORT = process.env.PORT || 3001;
 const SECRET_KEY = process.env.SECRET_KEY;
+const CORS_ORIGIN = (process.env.CORS_ORIGIN || 'http://localhost:5173')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
 
-// Servidor HTTP y Sockets para notificaciones
+const app = express();
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: '*', methods: ["GET", "POST", "PUT", "DELETE"] }
-});
+const corsOpts = { origin: CORS_ORIGIN, methods: ['GET', 'POST', 'PUT', 'DELETE'] };
+const io = new Server(server, { cors: corsOpts });
 
-// Middlewares
-app.use(cors());
-app.use(express.json({ limit: '50mb' }));
+app.use(cabecerasSeguras);
+app.use(cabecerasCSP);
+app.use(cors(corsOpts));
+app.use(express.json({ limit: '2mb' }));
 
-// Conexión a Supabase (PostgreSQL). La URL sale de la variable de entorno
-// DATABASE_URL (ver .env.example). Nunca commitear credenciales en el código.
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) {
   console.error('❌ Falta la variable de entorno DATABASE_URL. Copia .env.example a .env y completa la URL de conexión.');
   process.exit(1);
 }
 
-// La clave de firma de los JWT no puede tener un valor por defecto: quedaría
-// escrita en el repositorio y cualquiera que lo lea podría firmar tokens.
-// Sigue la misma convención que DATABASE_URL: entorno o salida limpia.
 if (!SECRET_KEY) {
   console.error('❌ Falta la variable de entorno SECRET_KEY. Genera una con: node -e "console.log(require(\'crypto\').randomBytes(48).toString(\'hex\'))"');
   process.exit(1);
 }
 
-// Contraseña del usuario administrador inicial. También es obligatoria para no
-// dejar una cuenta conocida con clave por defecto expuesta en cada despliegue nuevo.
 const ADMIN_INITIAL_PASSWORD = process.env.ADMIN_INITIAL_PASSWORD;
 if (!ADMIN_INITIAL_PASSWORD) {
   console.error('❌ Falta la variable de entorno ADMIN_INITIAL_PASSWORD (contraseña del admin inicial). Ver .env.example.');
   process.exit(1);
 }
+
+const ssl = process.env.DATABASE_SSL === 'disable'
+  ? false
+  : { rejectUnauthorized: process.env.PGSSL_REJECT_UNAUTHORIZED === 'true' };
+
 const pool = new Pool({
   connectionString: databaseUrl,
-  ssl: {
-    rejectUnauthorized: false
-  }
+  ssl
 });
 
 pool.connect((err, client, release) => {
@@ -65,6 +79,41 @@ pool.connect((err, client, release) => {
   console.log('✅ Conectado exitosamente a Supabase (Cloud)');
   release();
   inicializarTablas();
+});
+
+function enviarError(res, err) {
+  console.error(err);
+  if (!res.headersSent) res.status(500).json({ error: 'Error interno' });
+}
+
+function autenticar(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+  if (!token) return res.status(401).json({ error: 'No autorizado' });
+  try {
+    req.user = jwt.verify(token, SECRET_KEY);
+    next();
+  } catch (e) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+}
+
+function exigirPrivilegio(req, res, next) {
+  if (!esPrivilegiado(req.user?.role)) {
+    return res.status(403).json({ error: 'Permiso denegado' });
+  }
+  next();
+}
+
+io.use((socket, next) => {
+  const token = socket.handshake.auth?.token || socket.handshake.query?.token;
+  if (!token) return next(new Error('No autorizado'));
+  try {
+    jwt.verify(token, SECRET_KEY);
+    next();
+  } catch (e) {
+    next(new Error('No autorizado'));
+  }
 });
 
 function inicializarTablas() {
@@ -83,17 +132,18 @@ function inicializarTablas() {
 
   (async () => {
     try {
-      for (let q of queries) {
+      for (const q of queries) {
         await pool.query(q);
       }
-      // Insertar admin por defecto si no existe
-      const hashAdmin = bcrypt.hashSync(ADMIN_INITIAL_PASSWORD, 8);
-      await pool.query(
-        `INSERT INTO usuarios (username, nombre, password, cargo) 
-         VALUES ($1, $2, $3, $4) 
-         ON CONFLICT (username) DO NOTHING`,
-        ['admin', 'Administrador General', hashAdmin, 'admin']
-      );
+      const existente = await pool.query('SELECT username FROM usuarios WHERE username = $1', ['admin']);
+      if (existente.rows.length === 0) {
+        const hashAdmin = await bcrypt.hash(ADMIN_INITIAL_PASSWORD, BCRYPT_ROUNDS);
+        await pool.query(
+          `INSERT INTO usuarios (username, nombre, password, cargo)
+           VALUES ($1, $2, $3, $4)`,
+          ['admin', 'Administrador General', hashAdmin, 'admin']
+        );
+      }
       console.log('✅ Tablas verificadas/inicializadas en Supabase.');
     } catch (e) {
       console.error('❌ Error al inicializar tablas:', e.message);
@@ -101,69 +151,61 @@ function inicializarTablas() {
   })();
 }
 
-/**
- * Función auxiliar para desempaquetar la columna JSON
- */
-function parseRowData(row) {
-  if (!row) return null;
-  if (row.data) {
-    try {
-      const parsed = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
-      return { ...parsed, id: row.id || parsed.id };
-    } catch (e) {
-      return row;
-    }
+async function upsertJson(tabla, id, cuerpo) {
+  // Lista blanca: `tabla` se interpola en el SQL, así que no puede venir del
+  // pedido. Los llamados actuales pasan literales conocidos, pero el chequeo
+  // evita que un refactor futuro abra una inyección por interpolación.
+  if (!tablaEnBlanco(tabla)) {
+    throw new Error(`Tabla no permitida: ${String(tabla)}`);
   }
-  return row;
+  await pool.query(
+    `INSERT INTO ${tabla} (id, data) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET data = $2`,
+    [id, JSON.stringify(cuerpo)]
+  );
 }
 
-// ----------------------------------------------------------------------------
-// RUTAS DE LA API REST (/api)
-// ----------------------------------------------------------------------------
+app.get('/api/health', (_req, res) => {
+  res.json({ ok: true });
+});
 
-// Autenticación de Usuario
-app.post('/api/login', async (req, res) => {
-  const { username, password } = req.body;
+// Limita intentos de login por IP: sin esto, la API auxiliar queda abierta a
+// fuerza bruta. Es en memoria (una sola instancia); ver lib/security.js.
+const limitadorLogin = crearLimitadorLogin();
+
+// Limitador general para todos los endpoints protegidos (anti-abuso, DoS ligero).
+const limitadorGeneral = crearLimitadorGeneral({ ventanaMs: 60 * 1000, maxIntentos: 120, bloqueoMs: 60 * 1000 });
+
+app.post('/api/login', limitadorLogin, async (req, res) => {
+  const entrada = validarEntradaLogin(req.body);
+  if (!entrada.ok) {
+    return res.status(401).json({ error: 'Credenciales incorrectas' });
+  }
   try {
-    const result = await pool.query(`SELECT * FROM usuarios WHERE username = $1`, [username]);
-    if (result.rows.length === 0) return res.status(401).json({ error: "Credenciales incorrectas" });
-    
-    const user = result.rows[0];
-    let isMatch = false;
-    try {
-      isMatch = bcrypt.compareSync(password, user.password);
-    } catch (e) {
-      isMatch = (password === user.password);
+    const resultado = await autenticarUsuario(pool, entrada, SECRET_KEY);
+    if (!resultado.ok) {
+      return res.status(401).json({ error: resultado.error });
     }
-
-    if (!isMatch && password === user.password) {
-      isMatch = true;
-    }
-
-    if (!isMatch) {
-      return res.status(401).json({ error: "Credenciales incorrectas" });
-    }
-
-    const token = jwt.sign(
-      { username: user.username, role: user.cargo },
-      SECRET_KEY,
-      { expiresIn: '24h' }
-    );
-
-    res.json({
-      token,
-      user: { username: user.username, nombre: user.nombre, role: user.cargo }
-    });
+    res.json({ token: resultado.token, user: resultado.user });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    enviarError(res, err);
   }
 });
 
-// GET: Obtener todos los bienes
-app.get('/api/bens', async (req, res) => {
+app.use('/api', autenticar);
+app.use('/api', limitadorGeneral);
+// Sanitización ligera de cuerpos JSON entrantes (previene claves '__proto__',
+// 'constructor', 'prototype' y elimina claves nulas vacías).
+app.use('/api', (req, res, next) => {
+  if (req.body && typeof req.body === 'object' && !Array.isArray(req.body)) {
+    req.body = sanitizarObjeto(req.body);
+  }
+  next();
+});
+
+app.get('/api/bens', async (_req, res) => {
   try {
-    const result = await pool.query(`SELECT * FROM bens`);
-    const bienes = result.rows.map(r => {
+    const result = await pool.query('SELECT * FROM bens');
+    const bienes = result.rows.map((r) => {
       const item = parseRowData(r);
       return {
         ...item,
@@ -172,41 +214,39 @@ app.get('/api/bens', async (req, res) => {
         solicitudBaja: Boolean(item.solicitudBaja)
       };
     });
-
-    console.log(`📦 Enviando ${bienes.length} bienes al cliente.`);
     res.json(bienes);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    enviarError(res, err);
   }
 });
 
-// POST: Crear nuevo bien
 app.post('/api/bens', async (req, res) => {
   const b = req.body;
+  if (!idValido(b?.id)) return res.status(400).json({ error: 'Id inválido' });
   try {
-    const jsonStr = JSON.stringify(b);
-    await pool.query(
-      `INSERT INTO bens (id, data) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET data = $2`,
-      [b.id, jsonStr]
-    );
+    await upsertJson('bens', b.id, b);
     io.emit('data_updated');
-    res.status(201).json({ message: "Bien creado exitosamente", id: b.id });
+    res.status(201).json({ message: 'Bien creado exitosamente', id: b.id });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    enviarError(res, err);
   }
 });
 
-// POST Masivo: Carga de archivo CSV
 app.post('/api/bens/bulk', async (req, res) => {
   const bienesArray = req.body;
-  if (!Array.isArray(bienesArray)) return res.status(400).json({ error: "Arreglo inválido" });
+  if (!Array.isArray(bienesArray)) return res.status(400).json({ error: 'Arreglo inválido' });
+  if (bienesArray.length > MAX_BULK) return res.status(400).json({ error: 'Demasiados registros' });
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    for (let b of bienesArray) {
+    for (const b of bienesArray) {
+      if (!idValido(b?.id)) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Id inválido en la carga masiva' });
+      }
       await client.query(
-        `INSERT INTO bens (id, data) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET data = $2`,
+        'INSERT INTO bens (id, data) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET data = $2',
         [b.id, JSON.stringify(b)]
       );
     }
@@ -214,228 +254,468 @@ app.post('/api/bens/bulk', async (req, res) => {
     io.emit('data_updated');
     res.status(201).json({ message: `${bienesArray.length} bienes importados` });
   } catch (err) {
-    await client.query('ROLLBACK');
-    res.status(500).json({ error: err.message });
+    try { await client.query('ROLLBACK'); } catch (e) { /* rollback ya falló */ }
+    enviarError(res, err);
   } finally {
     client.release();
   }
 });
 
-// PUT: Actualizar un bien
 app.put('/api/bens/:id', async (req, res) => {
-  const b = req.body;
+  if (!idValido(req.params.id)) return res.status(400).json({ error: 'Id inválido' });
   try {
-    await pool.query(
-      `UPDATE bens SET data = $1 WHERE id = $2`,
-      [JSON.stringify(b), req.params.id]
-    );
+    const result = await pool.query('UPDATE bens SET data = $1 WHERE id = $2', [JSON.stringify(req.body), req.params.id]);
+    if (result.rowCount === 0) return res.status(404).json({ error: 'No encontrado' });
     io.emit('data_updated');
-    res.json({ message: "Bien actualizado" });
+    res.json({ message: 'Bien actualizado' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    enviarError(res, err);
   }
 });
 
-// DELETE: Eliminar un bien
 app.delete('/api/bens/:id', async (req, res) => {
+  if (!idValido(req.params.id)) return res.status(400).json({ error: 'Id inválido' });
   try {
-    await pool.query(`DELETE FROM bens WHERE id = $1`, [req.params.id]);
+    const result = await pool.query('DELETE FROM bens WHERE id = $1', [req.params.id]);
+    if (result.rowCount === 0) return res.status(404).json({ error: 'No encontrado' });
     io.emit('data_updated');
-    res.json({ message: "Bien eliminado" });
+    res.json({ message: 'Bien eliminado' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    enviarError(res, err);
   }
 });
 
-// GET: Obtener registros FC-10
-app.get('/api/fc10', async (req, res) => {
+app.get('/api/fc10', async (_req, res) => {
   try {
-    const result = await pool.query(`SELECT * FROM fc10`);
-    res.json(result.rows.map(r => parseRowData(r)));
+    const result = await pool.query('SELECT * FROM fc10');
+    res.json(result.rows.map((r) => parseRowData(r)));
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    enviarError(res, err);
   }
 });
 
-// POST: Crear registro FC-10
 app.post('/api/fc10', async (req, res) => {
   const f = req.body;
+  if (!idValido(f?.id)) return res.status(400).json({ error: 'Id inválido' });
   try {
-    await pool.query(
-      `INSERT INTO fc10 (id, data) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET data = $2`,
-      [f.id, JSON.stringify(f)]
-    );
+    await upsertJson('fc10', f.id, f);
     io.emit('data_updated');
-    res.status(201).json({ message: "FC-10 registrado" });
+    res.status(201).json({ message: 'FC-10 registrado' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    enviarError(res, err);
   }
 });
 
-// PUT: Actualizar FC-10
 app.put('/api/fc10/:id', async (req, res) => {
-  const f = req.body;
+  if (!idValido(req.params.id)) return res.status(400).json({ error: 'Id inválido' });
   try {
-    await pool.query(`UPDATE fc10 SET data = $1 WHERE id = $2`, [JSON.stringify(f), req.params.id]);
+    const result = await pool.query('UPDATE fc10 SET data = $1 WHERE id = $2', [JSON.stringify(req.body), req.params.id]);
+    if (result.rowCount === 0) return res.status(404).json({ error: 'No encontrado' });
     io.emit('data_updated');
-    res.json({ message: "FC-10 actualizado" });
+    res.json({ message: 'FC-10 actualizado' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    enviarError(res, err);
   }
 });
 
-// DELETE: Eliminar FC-10
 app.delete('/api/fc10/:id', async (req, res) => {
+  if (!idValido(req.params.id)) return res.status(400).json({ error: 'Id inválido' });
   try {
-    await pool.query(`DELETE FROM fc10 WHERE id = $1`, [req.params.id]);
+    const result = await pool.query('DELETE FROM fc10 WHERE id = $1', [req.params.id]);
+    if (result.rowCount === 0) return res.status(404).json({ error: 'No encontrado' });
     io.emit('data_updated');
-    res.json({ message: "FC-10 eliminado" });
+    res.json({ message: 'FC-10 eliminado' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    enviarError(res, err);
   }
 });
 
-// GET: Obtener registros FC-11
-app.get('/api/fc11', async (req, res) => {
+app.get('/api/fc11', async (_req, res) => {
   try {
-    const result = await pool.query(`SELECT * FROM fc11`);
-    res.json(result.rows.map(r => parseRowData(r)));
+    const result = await pool.query('SELECT * FROM fc11');
+    res.json(result.rows.map((r) => parseRowData(r)));
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    enviarError(res, err);
   }
 });
 
-// POST: Crear registro FC-11
 app.post('/api/fc11', async (req, res) => {
   const f = req.body;
+  if (!idValido(f?.id)) return res.status(400).json({ error: 'Id inválido' });
   try {
-    await pool.query(
-      `INSERT INTO fc11 (id, data) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET data = $2`,
-      [f.id, JSON.stringify(f)]
-    );
+    await upsertJson('fc11', f.id, f);
     io.emit('data_updated');
-    res.status(201).json({ message: "FC-11 registrado" });
+    res.status(201).json({ message: 'FC-11 registrado' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    enviarError(res, err);
   }
 });
 
-// GET: Obtener registros FC-04
-app.get('/api/fc04', async (req, res) => {
+app.get('/api/fc04', async (_req, res) => {
   try {
-    const result = await pool.query(`SELECT * FROM fc04`);
-    res.json(result.rows.map(r => parseRowData(r)));
+    const result = await pool.query('SELECT * FROM fc04');
+    res.json(result.rows.map((r) => parseRowData(r)));
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    enviarError(res, err);
   }
 });
 
-// POST: Crear registro FC-04
 app.post('/api/fc04', async (req, res) => {
   const f = req.body;
+  if (!idValido(f?.id)) return res.status(400).json({ error: 'Id inválido' });
   try {
-    await pool.query(
-      `INSERT INTO fc04 (id, data) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET data = $2`,
-      [f.id, JSON.stringify(f)]
-    );
+    await upsertJson('fc04', f.id, f);
     io.emit('data_updated');
-    res.status(201).json({ message: "FC-04 registrado" });
+    res.status(201).json({ message: 'FC-04 registrado' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    enviarError(res, err);
   }
 });
 
-// GET: Obtener estructuras
-app.get('/api/estructuras', async (req, res) => {
+app.get('/api/estructuras', async (_req, res) => {
   try {
-    const result = await pool.query(`SELECT * FROM estructuras`);
-    res.json(result.rows.map(r => parseRowData(r)));
+    const result = await pool.query('SELECT * FROM estructuras');
+    res.json(result.rows.map((r) => parseRowData(r)));
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    enviarError(res, err);
   }
 });
 
-// POST: Crear estructura
 app.post('/api/estructuras', async (req, res) => {
   const e = req.body;
+  if (!idValido(e?.id)) return res.status(400).json({ error: 'Id inválido' });
   try {
-    await pool.query(
-      `INSERT INTO estructuras (id, data) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET data = $2`,
-      [e.id, JSON.stringify(e)]
-    );
-    res.status(201).json({ message: "Estructura guardada" });
+    await upsertJson('estructuras', e.id, e);
+    res.status(201).json({ message: 'Estructura guardada' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    enviarError(res, err);
   }
 });
 
-// GET: Usuarios
-app.get('/api/usuarios', async (req, res) => {
+app.get('/api/usuarios', exigirPrivilegio, async (_req, res) => {
   try {
-    const result = await pool.query(`SELECT username, nombre, cargo FROM usuarios`);
+    const result = await pool.query('SELECT username, nombre, cargo FROM usuarios');
     res.json(result.rows);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    enviarError(res, err);
   }
 });
 
-// POST: Crear usuario
-app.post('/api/usuarios', async (req, res) => {
-  const { username, nombre, password, cargo } = req.body;
+app.post('/api/usuarios', exigirPrivilegio, async (req, res) => {
+  const username = typeof req.body?.username === 'string' ? req.body.username.trim() : '';
+  const nombre = typeof req.body?.nombre === 'string' ? req.body.nombre.trim() : '';
+  const password = typeof req.body?.password === 'string' ? req.body.password : '';
+  const cargo = typeof req.body?.cargo === 'string' ? req.body.cargo.trim() : 'funcionario';
+  if (!idValido(username) || !nombre || password.length < 8) {
+    return res.status(400).json({ error: 'Datos de usuario inválidos' });
+  }
   try {
-    const hashedPassword = bcrypt.hashSync(password, 8);
+    const hashedPassword = await bcrypt.hash(password, BCRYPT_ROUNDS);
     await pool.query(
-      `INSERT INTO usuarios (username, nombre, password, cargo) VALUES ($1, $2, $3, $4)`,
+      'INSERT INTO usuarios (username, nombre, password, cargo) VALUES ($1, $2, $3, $4)',
       [username, nombre, hashedPassword, cargo]
     );
-    res.status(201).json({ message: "Usuario creado exitosamente" });
+    res.status(201).json({ message: 'Usuario creado exitosamente' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    enviarError(res, err);
   }
 });
 
-// DELETE: Eliminar usuario
-app.delete('/api/usuarios/:username', async (req, res) => {
+app.delete('/api/usuarios/:username', exigirPrivilegio, async (req, res) => {
+  const username = req.params.username;
+  if (!idValido(username)) return res.status(400).json({ error: 'Usuario inválido' });
+  if (req.user?.username === username) {
+    return res.status(400).json({ error: 'No podés eliminar tu propia cuenta' });
+  }
   try {
-    await pool.query(`DELETE FROM usuarios WHERE username = $1`, [req.params.username]);
-    res.json({ message: "Usuario eliminado" });
+    const result = await pool.query('DELETE FROM usuarios WHERE username = $1', [username]);
+    if (result.rowCount === 0) return res.status(404).json({ error: 'No encontrado' });
+    res.json({ message: 'Usuario eliminado' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    enviarError(res, err);
   }
 });
 
-// GET: Auditoría
-app.get('/api/auditoria', async (req, res) => {
+app.get('/api/auditoria', async (_req, res) => {
   try {
-    const result = await pool.query(`SELECT * FROM auditoria`);
-    res.json(result.rows.map(r => ({ ...r, leido: Boolean(r.leido) })));
+    const result = await pool.query('SELECT * FROM auditoria');
+    res.json(result.rows.map((r) => ({ ...r, leido: Boolean(r.leido) })));
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    enviarError(res, err);
   }
 });
 
-// POST: Crear notificación de auditoría
 app.post('/api/auditoria', async (req, res) => {
   const a = req.body;
+  if (!idValido(a?.id)) return res.status(400).json({ error: 'Id inválido' });
   try {
     await pool.query(
-      `INSERT INTO auditoria (id, tipoRegistro, usuarioDestino, titulo, mensaje, leido, fecha, bienId, accion) 
+      `INSERT INTO auditoria (id, tipoRegistro, usuarioDestino, titulo, mensaje, leido, fecha, bienId, accion)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
       [a.id, a.tipoRegistro, a.usuarioDestino, a.titulo, a.mensaje, a.leido ? 1 : 0, a.fecha, a.bienId || '', a.accion || '']
     );
-    res.status(201).json({ message: "Notificación creada" });
+    res.status(201).json({ message: 'Notificación creada' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    enviarError(res, err);
   }
 });
 
-// Manejador del servidor HTTP
+// ============================================================================
+// RUTAS DE RESPALDO Y RESTAURACIÓN (solo admin/desarrollador)
+// ============================================================================
+
+/**
+ * GET /api/respaldo/exportar
+ * Genera y devuelve un JSON completo de todas las tablas para descargar.
+ */
+app.get('/api/respaldo/exportar', exigirAdmin, async (_req, res) => {
+  try {
+    const filasPorTabla = {};
+    for (const clave of ORDEN_RESTAURACION) {
+      const pk = TABLAS_CONOCIDAS[clave];
+      let result;
+      if (clave === 'usuarios') {
+        result = await pool.query(`SELECT username, nombre, cargo, dependencia FROM ${clave}`);
+        filasPorTabla[clave] = result.rows;
+      } else if (clave === 'app_config') {
+        result = await pool.query(`SELECT * FROM ${clave}`);
+        filasPorTabla[clave] = result.rows;
+      } else {
+        // tablas JSONB: devolver { id, data } para conservar envoltura esperada.
+        result = await pool.query(`SELECT id, data FROM ${clave}`);
+        filasPorTabla[clave] = result.rows.map((r) => {
+          const data = typeof r.data === 'string' ? JSON.parse(r.data) : (r.data || {});
+          return { id: r.id, data };
+        });
+      }
+    }
+
+    const respaldo = armarRespaldo(filasPorTabla, (req.user && req.user.username) || 'sistema');
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', `attachment; filename="respaldo_${new Date().toISOString().slice(0,10)}.json"`);
+    res.json(respaldo);
+  } catch (err) {
+    enviarError(res, err);
+  }
+});
+
+/**
+ * POST /api/respaldo/restaurar
+ * Recibe un JSON de respaldo, valida esquema y escribe en la BD por lotes.
+ * Transacción por tabla: si falla una tabla, se hace rollback de esa tabla.
+ */
+app.post('/api/respaldo/restaurar', exigirAdmin, async (req, res) => {
+  const cliente = await pool.connect();
+  try {
+    const crudo = req.body;
+    const validacion = validarEsquemaRespaldo(crudo);
+
+    if (!validacion.ok) {
+      return res.status(400).json({ error: 'Validación de respaldo fallida', errores: validacion.errores, avisos: validacion.avisos });
+    }
+
+    const { tablas, metadata } = validacion;
+    const resultados = [];
+    const errores = [];
+
+    // Restaurar en orden de dependencias.
+    for (const clave of ORDEN_RESTAURACION) {
+      const filas = tablas[clave] || [];
+      if (filas.length === 0) {
+        resultados.push({ clave, etiqueta: clave, escritas: 0, ok: true });
+        continue;
+      }
+
+      const pk = TABLAS_CONOCIDAS[clave];
+      const ahora = new Date().toISOString();
+      let escritas = 0;
+      let falloTabla = null;
+
+      await cliente.query('BEGIN');
+      try {
+        // Escribir por lotes de 500.
+        for (let i = 0; i < filas.length; i += 500) {
+          const lote = filas.slice(i, i + 500);
+          if (clave === 'usuarios') {
+            // Usuarios: columnas sueltas (no JSONB). Se omite password del respaldo.
+            for (const f of lote) {
+              await cliente.query(
+                `INSERT INTO usuarios (username, nombre, cargo, dependencia)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (username) DO UPDATE SET nombre = EXCLUDED.nombre, cargo = EXCLUDED.cargo, dependencia = EXCLUDED.dependencia`,
+                [f.username, f.nombre || '', f.cargo || 'funcionario', f.dependencia || '']
+              );
+              escritas++;
+            }
+          } else if (clave === 'app_config') {
+            for (const f of lote) {
+              await cliente.query(
+                `INSERT INTO app_config (id, data) VALUES ($1, $2)
+                 ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data`,
+                [f.id, JSON.stringify(f)]
+              );
+              escritas++;
+            }
+          } else {
+            // Tablas JSONB: { id, data }.
+            for (const f of lote) {
+              const cuerpo = normalizarFilaParaEscribir(f, pk);
+              await cliente.query(
+                `INSERT INTO ${clave} (id, data) VALUES ($1, $2)
+                 ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data`,
+                [cuerpo.id || cuerpo[pk], JSON.stringify(cuerpo)]
+              );
+              escritas++;
+            }
+          }
+        }
+        await cliente.query('COMMIT');
+      } catch (e) {
+        await cliente.query('ROLLBACK');
+        falloTabla = e.message;
+        errores.push(`${clave}: ${falloTabla}`);
+      }
+
+      resultados.push({
+        clave,
+        etiqueta: clave,
+        escritas,
+        ok: !falloTabla,
+        error: falloTabla
+      });
+    }
+
+    // Auditoría de la restauración.
+    try {
+      await pool.query(
+        `INSERT INTO auditoria (id, tipoRegistro, usuarioDestino, titulo, mensaje, leido, fecha, bienId, accion)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [
+          require('crypto').randomBytes(16).toString('hex'),
+          'sistema',
+          (req.user && req.user.username) || 'sistema',
+          'Restauración de respaldo',
+          `Restaurado archivo "${metadata.fechaGeneracion}" con ${metadata.totalFilas} filas`,
+          0,
+          new Date().toISOString(),
+          '',
+          'RESTAURAR_RESPALDO'
+        ]
+      );
+    } catch (e) {
+      // No bloquear la respuesta si la auditoría falla.
+      console.error('Auditoría de restauración no se pudo registrar:', e.message);
+    }
+
+    const fallos = resultados.filter((r) => !r.ok).length;
+    if (fallos === 0) {
+      res.json({ message: 'Restauración completada exitosamente', resultados, totalFilas: metadata.totalFilas });
+    } else {
+      res.status(207).json({ message: `Restauración con ${fallos} error(es)`, resultados, errores });
+    }
+  } catch (err) {
+    try { await cliente.query('ROLLBACK'); } catch (_) {}
+    enviarError(res, err);
+  } finally {
+    cliente.release();
+  }
+});
+
+/**
+ * PATCH /api/fc10/:id/firma-estado
+ * Cambia manualmente el estado de firma de un acta FC-10.
+ * SOLO rol admin/desarrollador (protegido por exigirAdmin).
+ * Cuerpo: { estadoFirma: 'BORRADOR'|'ESPERA_FIRMA_1'|'ESPERA_FIRMA_2'|'CERRADO', registradoPor?: string }
+ */
+app.patch('/api/fc10/:id/firma-estado', exigirAdmin, async (req, res) => {
+  if (!idValido(req.params.id)) {
+    return res.status(400).json({ error: 'Id inválido' });
+  }
+  const { estadoFirma, registradoPor } = req.body;
+  const validos = ['BORRADOR', 'ESPERA_FIRMA_1', 'ESPERA_FIRMA_2', 'CERRADO'];
+  if (!estadoFirma || !validos.includes(estadoFirma)) {
+    return res.status(400).json({ error: 'estadoFirma inválido' });
+  }
+
+  try {
+    // Leer el acta actual.
+    const actual = await pool.query('SELECT data FROM fc10 WHERE id = $1', [req.params.id]);
+    if (actual.rowCount === 0) {
+      return res.status(404).json({ error: 'Acta FC-10 no encontrada' });
+    }
+
+    const data = typeof actual.rows[0].data === 'string' ? JSON.parse(actual.rows[0].data) : actual.rows[0].data;
+    const ahora = new Date().toISOString();
+    const usuario = registradoPor || (req.user && req.user.username) || 'admin';
+
+    const actualizado = {
+      ...data,
+      estadoFirma,
+      firmaEstadoManual: true,
+      firmaEstadoActualizadoPor: usuario,
+      firmaEstadoActualizadoEn: ahora
+    };
+
+    if (estadoFirma === 'CERRADO') {
+      actualizado.fechaCierreFirmaManual = ahora;
+    }
+
+    const result = await pool.query('UPDATE fc10 SET data = $1 WHERE id = $2', [JSON.stringify(actualizado), req.params.id]);
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Acta FC-10 no encontrada' });
+    }
+
+    io.emit('data_updated');
+    res.json({ message: 'Estado de firma actualizado', id: req.params.id, estadoFirma });
+  } catch (err) {
+    enviarError(res, err);
+  }
+});
+
+// ============================================================================
+// RUTAS DE CONFIGURACIÓN GLOBAL (mantenimiento, etc.)
+// ============================================================================
+
+app.get('/api/app_config', exigirPrivilegio, async (_req, res) => {
+  try {
+    const result = await pool.query("SELECT * FROM app_config WHERE id = 'global'");
+    if (result.rowCount === 0) {
+      return res.json({ id: 'global', en_mantenimiento: false, mensaje: '', mejoras: [], ultima_version: '' });
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    // Si la tabla no existe aún, devolver config vacía sin error.
+    res.json({ id: 'global', en_mantenimiento: false, mensaje: '', mejoras: [], ultima_version: '' });
+  }
+});
+
+app.patch('/api/app_config', exigirPrivilegio, async (req, res) => {
+  try {
+    const payload = { id: 'global', ...req.body };
+    await pool.query(
+      `INSERT INTO app_config (id, data) VALUES ($1, $2)
+       ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data`,
+      ['global', JSON.stringify(payload)]
+    );
+    io.emit('data_updated');
+    res.json({ message: 'Configuración actualizada', config: payload });
+  } catch (err) {
+    enviarError(res, err);
+  }
+});
+
 server.on('error', (err) => {
   if (err.code === 'EADDRINUSE') {
     console.error(`❌ El puerto ${PORT} está ocupado. Cierra los otros procesos node de tu sistema.`);
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`🚀 Servidor Backend corriendo en http://localhost:${PORT}`);
-});
+// Solo escuchar si se ejecuta directamente (desarrollo local).
+// En Vercel se usa el handler en api/index.js que importa esta app.
+if (require.main === module) {
+  server.listen(PORT, () => {
+    console.log(`🚀 Servidor Backend corriendo en http://localhost:${PORT}`);
+  });
+}
+
+module.exports = { app, io, pool };

@@ -3,9 +3,18 @@
  * Lee el archivo 'patrimonio.sqlite' local y sube todos los datos a Supabase.
  */
 
+require('dotenv').config();
+
 const path = require('path');
-const sqlite3 = require('sqlite3').verbose();
 const { Pool } = require('pg');
+
+let sqlite3;
+try {
+  sqlite3 = require('sqlite3').verbose();
+} catch (e) {
+  console.error('❌ sqlite3 no está instalado. Este script es one-shot: npm install sqlite3 --no-save');
+  process.exit(1);
+}
 
 // Conexión a la base de datos SQLite local
 const dbPath = path.join(__dirname, 'patrimonio.sqlite');

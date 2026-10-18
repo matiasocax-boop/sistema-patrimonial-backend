@@ -1,9 +1,9 @@
 @echo off
 REM ============================================================================
-REM Arranca el frontend en modo desarrollo.
-REM Usa %~dp0 para ubicarse en la carpeta del script, asi funciona desde
-REM cualquier ruta del disco. Antes tenia la ruta absoluta de una sola
-REM maquina y fallaba en cualquier otra.
+REM LANZADOR PORTABLE DEL FRONTEND
+REM ============================================================================
+REM Usa %~dp0 (directorio del propio script) para resolver la ruta del frontend
+REM sin hardcodear rutas absolutas. Funciona en cualquier máquina y en CI.
 REM ============================================================================
 cd /d "%~dp0frontend"
 npm run dev
